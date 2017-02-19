@@ -1,0 +1,6 @@
+jupyter
+xgboost
+scipy
+scikit-learn
+pandas
+seaborn
