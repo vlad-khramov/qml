@@ -1,50 +1,67 @@
+import inspect
 import json
 from collections import OrderedDict
 from pathlib import Path
-from random import random
+import random
 
 import pandas as pd
 import hashlib
 import numpy as np
 from scipy.stats.mstats import gmean
 import xgboost as xgb
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.linear_model import LogisticRegression
+from sklearn.neighbors import KNeighborsClassifier
+from sklearn.tree import DecisionTreeClassifier
+
+from qml.cv import QCV
 from qml.helpers import get_engine, save
 from qml.config import *
 
 
 class QModels:
 
+    @classmethod
+    def get_instance(cls):
+        if not getattr(cls, 'instance', False):
+            cls.instance = QModels()
+        return cls.instance
+
     def __init__(self):
         self.models = {}
         #todo create cs in cv_data
 
-    def qpredict(self, model_id, data_id, data=None, ids=None, tag='', save_result=True, save_model=False):
+    def qpredict(self, model_id, data_id, data=None, ids=None, tag='', save_result=True, save_model=False, force=False):
         if ids is not None:
             train_ids, test_ids = ids
             res = self._check_result_exists(model_id, data_id, train_ids, test_ids, tag)
-            if res:
+            if res is not None and not force:
                 return res
 
         if data is None:
-            Y_train = pd.read_csv(QML_TRAIN_Y_FILE, index_col=QML_INDEX_COL)
-            X_train = pd.read_csv(QML_TRAIN_X_FILE_MASK.format(data_id), index_col=QML_INDEX_COL)
-            X_test = pd.read_csv(QML_TEST_X_FILE_MASK.format(data_id), index_col=QML_INDEX_COL)
+            #todo
+            load_data_id = data_id if data_id >0 else 1
+            Y_train = pd.read_csv(QML_TRAIN_Y_FILE_MASK.format(load_data_id), index_col=QML_INDEX_COL)
+            X_train = pd.read_csv(QML_TRAIN_X_FILE_MASK.format(load_data_id), index_col=QML_INDEX_COL)
+            X_test = pd.read_csv(QML_TEST_X_FILE_MASK.format(load_data_id), index_col=QML_INDEX_COL)
 
             if ids is None:
                 train_ids = Y_train.index.values
                 test_ids = X_test.index.values
             else:
-                X_train = X_train.loc[train_ids]
+                temp = pd.concat([X_train, X_test])
+                X_train = temp.loc[train_ids]
                 Y_train = Y_train.loc[train_ids][QML_RES_COL]
-                X_test = X_test.loc[test_ids]
+                X_test = temp.loc[test_ids]
+                temp = None
         else:
             X_train, Y_train, X_test = data
             train_ids = Y_train.index.values
             test_ids = X_test.index.values
 
-        if ids is None:
+        if ids is None and not force:
             res = self._check_result_exists(model_id, data_id, train_ids, test_ids, tag)
-            if res:
+            if res is not None and not force:
                 return res
 
         model = self.get_model(model_id)
@@ -52,12 +69,19 @@ class QModels:
 
         if save_model:
             save(fit_res, QML_DATA_DIR + 'models/' + 'm{0:0=7d}_d{1:0=3d}__tr_{2}_ts_{3}_t_{4}'.format(
-                data_id, model_id, len(X_train), len(X_test), tag
+                model_id, data_id, len(X_train), len(X_test), tag
             ))
 
         predict_fn = getattr(fit_res, model.qml_predict_fn)
 
-        res = predict_fn(X_test)
+        predict_fn_kwargs = {}
+        if 'force' in inspect.getfullargspec(predict_fn).args:
+            predict_fn_kwargs['force'] = force
+
+
+        res = predict_fn(X_test, **predict_fn_kwargs)
+
+
         #todo
         if model.qml_predict_fn == 'predict_proba':
             res = [x[1] for x in res]
@@ -90,26 +114,29 @@ class QModels:
         return filename
 
     def get_model(self, model_id):
+        if model_id not in self.models:
+            self._load_model(model_id)
         return self.models[model_id]
 
     def add(self, model_id, model, description=None, predict_fn='predict', description_params=None):
         _, conn = get_engine()
 
         description = description if description else ''
-        res = conn.execute("select cls, params, descr from qml_models where model_id={}".format(model_id)).fetchone()
+        res = conn.execute("select cls, params, descr, predict_fn from qml_models where model_id={}".format(model_id)).fetchone()
         if res:
-            if res['cls'] != self.get_class(model) or res['params'] != self.get_params(model, description_params) or res['descr'] != description:
+            if res['cls'] != self.get_class(model) or res['params'] != self.get_params(model, description_params):
                 raise Exception('Model {} changed'.format(model_id))
         else:
             conn.execute(
                 """
-                    insert into qml_models (model_id, cls, params, descr) values
-                    ({}, '{}', '{}', '{}')
+                    insert into qml_models (model_id, cls, params, descr, predict_fn) values
+                    ({}, '{}', '{}', '{}', '{}')
                 """.format(
                     model_id,
                     self.get_class(model),
                     self.get_params(model, description_params),
-                    description
+                    description,
+                    predict_fn
                 )
             )
         self.models[model_id] = model
@@ -117,6 +144,39 @@ class QModels:
         model.qml_predict_fn = predict_fn
 
         conn.close()
+
+    def add_by_params(self, model, description=None, predict_fn='predict', description_params=None):
+        _, conn = get_engine()
+
+        description = description if description else ''
+        cls = self.get_class(model)
+        description_params = self.get_params(model, description_params)
+
+        res = conn.execute(
+            """
+                select model_id 
+                from qml_models 
+                where 
+                    cls='{}'
+                    and params='{}'
+            """.format(cls, description_params)
+        ).fetchone()
+        if res:
+            return res['model_id']
+        else:
+            conn.execute(
+                """
+                    insert into qml_models (model_id, cls, params, descr, predict_fn) values
+                    (null, '{}', '{}', '{}', '{}')
+                """.format(cls, description_params, description, predict_fn),
+            )
+        model_id=conn.execute('SELECT LAST_INSERT_ID() AS id').fetchone()[0]
+        self.models[model_id] = model
+        model.qml_descr = description
+        model.qml_predict_fn = predict_fn
+
+        conn.close()
+        return model_id
 
     def get_class(self, model):
         return str(model.__class__.__name__)
@@ -127,6 +187,41 @@ class QModels:
     @classmethod
     def normalize_params(cls, params):
         return json.dumps(OrderedDict(sorted(params.items())))
+
+    def _load_model(self, model_id):
+        _, conn = get_engine()
+
+        #todo
+        models = {
+            'QXgb': QXgb,
+            'KNeighborsClassifier': KNeighborsClassifier,
+            'QAvg': QAvg,
+            'QRankedAvg': QRankedAvg,
+            'QRankedByLineAvg': QRankedByLineAvg,
+            'QStackModel': QStackModel,
+            'LogisticRegression': LogisticRegression,
+            'DecisionTreeClassifier': DecisionTreeClassifier,
+            'QPostProcessingModel': QPostProcessingModel,
+            'RandomForestClassifier': RandomForestClassifier
+
+        }
+
+        res = conn.execute(
+            """
+                select cls, params, descr, predict_fn
+                from qml_models 
+                where 
+                    model_id='{}'
+            """.format(model_id)
+        ).fetchone()
+
+        if not res:
+            raise Exception('Missing {} model'.format(model_id))
+
+        model = models[res['cls']](**json.loads(res['params']))
+        self.add(model_id, model, res['descr'], res['predict_fn'])
+
+
 
     def get_cv_score(self, model_id, data_id):
         _, conn = get_engine()
@@ -193,8 +288,7 @@ class QXgb:
 ####################################
 
 class QAvg:
-    def __init__(self, qm, models, is_geom=False):
-        self.qm = qm
+    def __init__(self, models, is_geom=False):
         self.models = models
         self.is_geom = is_geom
 
@@ -208,18 +302,20 @@ class QAvg:
         self.train_X, self.train_Y = X, Y
         return self
 
-    def predict(self, X):
+    def predict(self, X, force=False):
+        qm = QModels.get_instance()
+
         A1 = None
         i=0
         for (model_id, data_id) in self.models:
             i+=1
-            res = self.qm.qpredict(
-                model_id, data_id, data=[self.train_X, self.train_Y, X]
+            res = qm.qpredict(
+                model_id, data_id, ids=[self.train_X.index.values, X.index.values], force=force
             )
             if A1 is None:
                 A1 = res
             else:
-                A1['gender{}'.format(i)] = res['gender']
+                A1[QML_RES_COL + '{}'.format(i)] = res[QML_RES_COL]
 
         if self.is_geom:
             return list(gmean(A1, axis=1))
@@ -230,8 +326,7 @@ class QAvg:
 ####################################
 
 class QRankedAvg:
-    def __init__(self, qm, models):
-        self.qm = qm
+    def __init__(self, models):
         self.models = models
 
     def get_params(self):
@@ -243,17 +338,19 @@ class QRankedAvg:
         self.train_X, self.train_Y = X, Y
         return self
 
-    def predict(self, X):
+    def predict(self, X, force=False):
+        qm = QModels.get_instance()
+
         A1 = None
         i=0
         cv_score_sum = 0
         for (model_id, data_id) in self.models:
             i+=1
-            res = self.qm.qpredict(
-                model_id, data_id, data=[self.train_X, self.train_Y, X]
+            res = qm.qpredict(
+                model_id, data_id, ids=[self.train_X.index.values, X.index.values], force=force
             )
 
-            cv_score = self.qm.get_cv_score(model_id, data_id)
+            cv_score = qm.get_cv_score(model_id, data_id)
             cv_score_sum += cv_score
 
             if A1 is None:
@@ -262,14 +359,56 @@ class QRankedAvg:
             else:
                 A1['col{}'.format(i)] = res[QML_RES_COL].apply(lambda x: float(x)*float(cv_score))
 
-        return [float(x)/float(cv_score_sum) for x in list(A1.mean(axis=1))]
+        del A1[QML_RES_COL]
+        return [float(x)/float(cv_score_sum) for x in list(A1.sum(axis=1))]
+
+class QRankedByLineAvg:
+    def __init__(self, models):
+        self.models = models
+
+    def get_params(self):
+        return {
+            'models': self.models
+        }
+
+    def fit(self, X, Y):
+        self.train_X, self.train_Y = X, Y
+        return self
+
+    def predict(self, X, force=False):
+        qm = QModels.get_instance()
+
+        temp = []
+
+        for (model_id, data_id) in self.models:
+            res = qm.qpredict(
+                model_id, data_id, ids=[self.train_X.index.values, X.index.values], force=force
+            )
+
+            cv_score = qm.get_cv_score(model_id, data_id)
+
+            temp.append([model_id, data_id, cv_score, res])
+
+        temp = sorted(temp, key=lambda x: x[2])
+        A1 = None
+        score_sum = 0
+        for i, [model_id, data_id, cv_score, res] in enumerate(temp):
+            score = i+1
+            score_sum +=score
+            if A1 is None:
+                A1 = res
+                A1['col{}'.format(i)] = A1[QML_RES_COL].apply(lambda x: float(x)*float(score))
+            else:
+                A1['col{}'.format(i)] = res[QML_RES_COL].apply(lambda x: float(x)*float(score))
+
+        del A1[QML_RES_COL]
+        return [float(x)/float(score_sum) for x in list(A1.sum(axis=1))]
 
 
 ####################################
 
 class QStackModel:
-    def __init__(self, qm, models, second_layer_model):
-        self.qm = qm
+    def __init__(self, models, second_layer_model):
         self.models = models
         self.second_layer_model = second_layer_model
 
@@ -284,7 +423,9 @@ class QStackModel:
         self.train_Y = Y
         return self
 
-    def predict(self, X, cv_parts='', cv_part=''):
+    def predict(self, X, force=False):
+        qm = QModels.get_instance()
+        #cv = QCV(qm)
 
         ###level1
         middle = round(len(self.train_ids)/2)
@@ -294,42 +435,42 @@ class QStackModel:
 
 
         A_train = A_test = None
-        for (model_id, data_id) in self.models:
-            res1 = self.qm.qpredict(
-                model_id, data_id, ids=[train_ids1, train_ids2], cv_parts=cv_parts, cv_part=cv_part
+        for i, (model_id, data_id) in enumerate(self.models):
+            res1 = qm.qpredict(
+                model_id, data_id, ids=[train_ids1, train_ids2], force=force
             )
-            res2 = self.qm.qpredict(
-                model_id, data_id, ids=[train_ids2, train_ids1], cv_parts=cv_parts, cv_part=cv_part
+            res2 = qm.qpredict(
+                model_id, data_id, ids=[train_ids2, train_ids1], force=force
             )
 
-            col = pd.concat([res2, res1]).rename(index=str, columns={"gender": "m_{}_{}".format(model_id, data_id)})
+            col = pd.concat([res2, res1]).rename(index=str, columns={QML_RES_COL: "m_{}".format(i)})
             if A_train is None:
                 A_train = col
             else:
                 A_train = A_train.join(col)
 
-            res = self.qm.qpredict(
-                model_id, data_id, ids=[self.train_ids, X.index.values], cv_parts=cv_parts, cv_part=cv_part
+            res = qm.qpredict(
+                model_id, data_id, ids=[self.train_ids, X.index.values], force=force
             )
 
-            col = res.rename(index=str, columns={"gender": "m_{}_{}".format(model_id, data_id)})
+            col = res.rename(index=str, columns={QML_RES_COL: "m_{}".format(i)})
             if A_test is None:
                 A_test = col
             else:
                 A_test = A_test.join(col)
 
-        return list(self.qm.qpredict(
-            self.second_layer_model, 1, data=[A_train, self.train_Y, A_test], cv_parts=cv_parts, cv_part=cv_part,
-            save_result=False
-        )['gender'])
+
+        return list(
+            qm.qpredict(
+                self.second_layer_model, -1, data=[A_train, self.train_Y, A_test],
+                save_result=False
+            )[QML_RES_COL]
+        )
 
 ####################################
 
 class QPostProcessingModel:
-    supports_cv = True
-
-    def __init__(self, qm, model_id, data_id, fn):
-        self.qm = qm
+    def __init__(self, model_id, data_id, fn):
         self.model_id = model_id
         self.data_id = data_id
         self.fn = fn
@@ -346,5 +487,5 @@ class QPostProcessingModel:
         return self
 
     def predict(self, X, cv_parts='', cv_part=''):
-        res = self.qm.qpredict(self.model_id, self.data_id, data=[self.train_X, self.train_Y, X], cv_parts=cv_parts, cv_part=cv_part)
-        return self.fn(list(res['gender']))
+        res = QModels.get_instance().qpredict(self.model_id, self.data_id, data=[self.train_X, self.train_Y, X])
+        return self.fn(X, res)
