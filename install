@@ -1,0 +1,14 @@
+
+sudo apt-get update
+sudo apt-get install python3 mysql-server mysql-client python3-pip mc libmysqlclient-dev
+
+sudo pip3 install --upgrade pip
+sudo pip3 install --upgrade setuptools
+
+sudo pip3 install scipy scikit-learn pandas hyperopt sqlalchemy mysqlclient pymysql
+
+git clone --recursive https://github.com/dmlc/xgboost
+cd xgboost; make -j4
+cd python-package; sudo python3 setup.py install
+
+
